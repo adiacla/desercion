@@ -1,0 +1,3 @@
+streamlit
+pyspark==4.0.5
+pandas
