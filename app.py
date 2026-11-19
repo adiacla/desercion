@@ -95,7 +95,14 @@ class VectorAssembler:
     salida: str
 
     def aplicar(self, cols: dict) -> None:
-        cols[self.salida] = [float(cols[c]) for c in self.entradas]
+        resultado: list[float] = []
+        for c in self.entradas:
+            v = cols[c]
+            if isinstance(v, list):
+                resultado.extend(v)
+            else:
+                resultado.append(float(v))
+        cols[self.salida] = resultado
 
 
 @dataclass
@@ -139,6 +146,49 @@ class MinMaxScaler:
                 esc = 0.5
             out.append(esc * (self.max_sal - self.min_sal) + self.min_sal)
         cols[self.salida] = out
+
+
+@dataclass
+class IndexadorTexto:
+    """StringIndexerModel (una o varias columnas). Si una columna de entrada no
+    existe (p. ej. la etiqueta en predicción), Spark omite esa columna; aquí igual."""
+    entradas: list[str]
+    salidas: list[str]
+    etiquetas: list[list[str]]
+    invalidos: str = "error"
+
+    def aplicar(self, cols: dict) -> None:
+        for ent, sal, etiq in zip(self.entradas, self.salidas, self.etiquetas):
+            if ent not in cols:
+                continue
+            v = cols[ent]
+            candidatos = [str(v)]
+            if isinstance(v, (int, float)) and float(v).is_integer():
+                candidatos += [str(int(v)), str(float(v))]  # Spark castea números a texto
+            for c in candidatos:
+                if c in etiq:
+                    cols[sal] = float(etiq.index(c))
+                    break
+            else:
+                if self.invalidos == "keep":
+                    cols[sal] = float(len(etiq))
+                else:
+                    raise ValueError(f"Valor '{v}' no visto en el entrenamiento para '{ent}'.")
+
+
+@dataclass
+class OneHot:
+    entradas: list[str]
+    salidas: list[str]
+    tamanos: list[int]  # tamaño final del vector de cada columna
+
+    def aplicar(self, cols: dict) -> None:
+        for ent, sal, n in zip(self.entradas, self.salidas, self.tamanos):
+            vec = [0.0] * n
+            i = int(cols[ent])
+            if 0 <= i < n:
+                vec[i] = 1.0
+            cols[sal] = vec
 
 
 @dataclass
@@ -207,6 +257,32 @@ def construir_etapa(ruta: Path):
     if clase == "VectorAssembler":
         return VectorAssembler(p["inputCols"], p.get("outputCol", meta["uid"] + "__output"))
 
+    if clase == "StringIndexerModel":
+        d = leer_parquet(data)[0]
+        if d.get("labelsArray"):
+            etiquetas = [list(x) for x in d["labelsArray"]]
+        else:
+            etiquetas = [list(d["labels"])]
+        entradas = p["inputCols"] if "inputCols" in p else [p["inputCol"]]
+        salidas = p["outputCols"] if "outputCols" in p else [p["outputCol"]]
+        return IndexadorTexto(entradas, salidas, etiquetas, p.get("handleInvalid", "error"))
+
+    if clase == "OneHotEncoderModel":
+        d = leer_parquet(data)[0]
+        quitar_ultima = p.get("dropLast", True)
+        conservar = p.get("handleInvalid", "error") == "keep"
+        tamanos = []
+        for s in d["categorySizes"]:
+            if not quitar_ultima and conservar:
+                tamanos.append(s + 1)
+            elif quitar_ultima and not conservar:
+                tamanos.append(s - 1)
+            else:
+                tamanos.append(s)
+        entradas = p["inputCols"] if "inputCols" in p else [p["inputCol"]]
+        salidas = p["outputCols"] if "outputCols" in p else [p["outputCol"]]
+        return OneHot(entradas, salidas, tamanos)
+
     if clase == "StandardScalerModel":
         d = leer_parquet(data)[0]
         return StandardScaler(
@@ -273,7 +349,8 @@ def cargar_modelo() -> Modelo:
         key=lambda d: int(d.name.split("_", 1)[0]),
     )
     etapas = [construir_etapa(d) for d in carpetas]
-    return Modelo(etapas, etapas[-1].salida_prob)
+    col_prob = next(e.salida_prob for e in reversed(etapas) if hasattr(e, "salida_prob"))
+    return Modelo(etapas, col_prob)
 
 
 # ----------------------------------------------------------------------------
