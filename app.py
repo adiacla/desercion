@@ -1,28 +1,28 @@
-# app.py — Predicción de deserción y éxito académico (Streamlit + Spark ML)
+# app.py — Predicción de deserción y éxito académico (Streamlit + modelo Spark ML sin Spark)
 #
 # Archivos necesarios en el repositorio (misma carpeta):
 #   app.py | modelo_final/ (guardado desde Colab) | banner.jpg (opcional)
-#   requirements.txt: streamlit, pyspark (misma versión que en Colab), pandas
-#   packages.txt: default-jre
+#   requirements.txt: streamlit, pyarrow, pandas
+#   (ya NO se necesita pyspark ni packages.txt / Java)
 #
 # Ejecutar en local:  streamlit run app.py
 
-import os
+import json
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as parquet
 import streamlit as st
-from pyspark.ml import PipelineModel
-from pyspark.sql import SparkSession
-from pyspark.sql.types import DoubleType, IntegerType, StructField, StructType
 
-AUTOR = "Alfredo Diaz Claro"  # <-- cambia por el nombre del estudiante
+AUTOR = "Alfredo Diaz Claro"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "modelo_final")
-BANNER_PATH = os.path.join(BASE_DIR, "banner.jpg")
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "modelo_final"
+BANNER_PATH = BASE_DIR / "banner.jpg"
 
 # Mismo orden que label_model.labels del notebook (orden por frecuencia).
-# El modelo devuelve 0, 1, 2 y esta lista lo convierte de vuelta a texto.
 LABELS = ["Graduate", "Dropout", "Enrolled"]
 LABELS_ES = {
     "Graduate": "Graduado",
@@ -30,6 +30,251 @@ LABELS_ES = {
     "Enrolled": "Matriculado (sigue estudiando)",
 }
 COLORES = {"Graduate": "#1E8449", "Dropout": "#C0392B", "Enrolled": "#B9770E"}
+
+
+# ----------------------------------------------------------------------------
+# Lector de modelos Spark ML (PipelineModel) en Python puro
+# ----------------------------------------------------------------------------
+def leer_metadata(ruta: Path) -> dict:
+    """Lee metadata/part-* (una línea JSON) de un modelo o etapa de Spark."""
+    archivos = sorted(
+        p for p in (ruta / "metadata").iterdir()
+        if p.is_file() and not p.name.startswith(("_", "."))
+    )
+    texto = "".join(p.read_text(encoding="utf-8") for p in archivos).strip()
+    return json.loads(texto.splitlines()[0])
+
+
+def leer_parquet(ruta: Path) -> list[dict]:
+    """Lee una carpeta parquet de Spark (ignora _SUCCESS y .crc) como lista de dicts."""
+    return parquet.read_table(str(ruta)).to_pylist()
+
+
+def vector(v: dict) -> list[float]:
+    """Convierte un VectorUDT guardado (type 0 = disperso, 1 = denso) a lista densa."""
+    if v["type"] == 1:
+        return [float(a) for a in v["values"]]
+    denso = [0.0] * v["size"]
+    for i, a in zip(v["indices"], v["values"]):
+        denso[i] = float(a)
+    return denso
+
+
+def matriz(m: dict) -> list[list[float]]:
+    """Convierte un MatrixUDT guardado a lista de filas (numRows x numCols)."""
+    filas, cols = m["numRows"], m["numCols"]
+    transpuesta = bool(m["isTransposed"])
+    vals = m["values"]
+    if m["type"] == 1:  # densa
+        if transpuesta:  # fila-mayor
+            return [[float(vals[i * cols + j]) for j in range(cols)] for i in range(filas)]
+        return [[float(vals[j * filas + i]) for j in range(cols)] for i in range(filas)]
+    # dispersa: CSC (por columnas) o CSR (si isTransposed)
+    out = [[0.0] * cols for _ in range(filas)]
+    ptrs, idx = m["colPtrs"], m["rowIndices"]
+    if not transpuesta:
+        for j in range(cols):
+            for k in range(ptrs[j], ptrs[j + 1]):
+                out[idx[k]][j] = float(vals[k])
+    else:
+        for i in range(filas):
+            for k in range(ptrs[i], ptrs[i + 1]):
+                out[i][idx[k]] = float(vals[k])
+    return out
+
+
+def normalizar(v: list[float]) -> list[float]:
+    total = sum(v)
+    return [a / total for a in v] if total > 0 else [1.0 / len(v)] * len(v)
+
+
+# ---- Etapas -----------------------------------------------------------------
+@dataclass
+class VectorAssembler:
+    entradas: list[str]
+    salida: str
+
+    def aplicar(self, cols: dict) -> None:
+        cols[self.salida] = [float(cols[c]) for c in self.entradas]
+
+
+@dataclass
+class StandardScaler:
+    entrada: str
+    salida: str
+    media: list[float]
+    desv: list[float]
+    con_media: bool
+    con_desv: bool
+
+    def aplicar(self, cols: dict) -> None:
+        x = cols[self.entrada]
+        out = []
+        for i, v in enumerate(x):
+            if self.con_media:
+                v -= self.media[i]
+            if self.con_desv:
+                v = v / self.desv[i] if self.desv[i] != 0 else 0.0
+            out.append(v)
+        cols[self.salida] = out
+
+
+@dataclass
+class MinMaxScaler:
+    entrada: str
+    salida: str
+    min_orig: list[float]
+    max_orig: list[float]
+    min_sal: float
+    max_sal: float
+
+    def aplicar(self, cols: dict) -> None:
+        x = cols[self.entrada]
+        out = []
+        for i, v in enumerate(x):
+            rango = self.max_orig[i] - self.min_orig[i]
+            if rango != 0:
+                esc = (v - self.min_orig[i]) / rango
+            else:
+                esc = 0.5
+            out.append(esc * (self.max_sal - self.min_sal) + self.min_sal)
+        cols[self.salida] = out
+
+
+@dataclass
+class RegresionLogistica:
+    entrada: str
+    salida_prob: str
+    coef: list[list[float]]   # clases x características
+    intercepto: list[float]
+
+    def aplicar(self, cols: dict) -> None:
+        x = cols[self.entrada]
+        margenes = [
+            sum(c * v for c, v in zip(fila, x)) + b
+            for fila, b in zip(self.coef, self.intercepto)
+        ]
+        m = max(margenes)
+        exps = [math.exp(a - m) for a in margenes]
+        cols[self.salida_prob] = normalizar(exps)
+
+
+@dataclass
+class Arbol:
+    nodos: dict[int, dict] = field(default_factory=dict)
+
+    def estadisticas_hoja(self, x: list[float]) -> list[float]:
+        n = self.nodos[0]
+        while n["leftChild"] != -1:
+            s = n["split"]
+            if s["numCategories"] == -1:  # continua: izquierda si x <= umbral
+                izq = x[s["featureIndex"]] <= s["leftCategoriesOrThreshold"][0]
+            else:  # categórica
+                izq = x[s["featureIndex"]] in s["leftCategoriesOrThreshold"]
+            n = self.nodos[n["leftChild"] if izq else n["rightChild"]]
+        return n["impurityStats"]
+
+
+@dataclass
+class Bosque:
+    entrada: str
+    salida_prob: str
+    arboles: list[Arbol]
+    pesos: list[float]
+
+    def aplicar(self, cols: dict) -> None:
+        x = cols[self.entrada]
+        acum = None
+        for arbol, peso in zip(self.arboles, self.pesos):
+            p = normalizar(arbol.estadisticas_hoja(x))
+            if acum is None:
+                acum = [0.0] * len(p)
+            acum = [a + peso * b for a, b in zip(acum, p)]
+        cols[self.salida_prob] = normalizar(acum)
+
+
+# ---- Constructores por clase de Spark --------------------------------------
+def _nodos(filas: list[dict]) -> dict[int, dict]:
+    return {f["id"]: f for f in filas}
+
+
+def construir_etapa(ruta: Path):
+    meta = leer_metadata(ruta)
+    clase = meta["class"].split(".")[-1]
+    p = meta.get("paramMap", {})
+    data = ruta / "data"
+
+    if clase == "VectorAssembler":
+        return VectorAssembler(p["inputCols"], p.get("outputCol", meta["uid"] + "__output"))
+
+    if clase == "StandardScalerModel":
+        d = leer_parquet(data)[0]
+        return StandardScaler(
+            p["inputCol"], p["outputCol"], vector(d["mean"]), vector(d["std"]),
+            p.get("withMean", False), p.get("withStd", True),
+        )
+
+    if clase == "MinMaxScalerModel":
+        d = leer_parquet(data)[0]
+        return MinMaxScaler(
+            p["inputCol"], p["outputCol"], vector(d["originalMin"]), vector(d["originalMax"]),
+            p.get("min", 0.0), p.get("max", 1.0),
+        )
+
+    if clase == "LogisticRegressionModel":
+        d = leer_parquet(data)[0]
+        return RegresionLogistica(
+            p.get("featuresCol", "features"), p.get("probabilityCol", "probability"),
+            matriz(d["coefficientMatrix"]), vector(d["interceptVector"]),
+        )
+
+    if clase == "DecisionTreeClassificationModel":
+        arbol = Arbol(_nodos(leer_parquet(data)))
+        return Bosque(p.get("featuresCol", "features"), p.get("probabilityCol", "probability"),
+                      [arbol], [1.0])
+
+    if clase == "RandomForestClassificationModel":
+        por_arbol: dict[int, list[dict]] = {}
+        for fila in leer_parquet(data):
+            por_arbol.setdefault(fila["treeID"], []).append(fila["nodeData"])
+        ids = sorted(por_arbol)
+        pesos_meta = {f["treeID"]: f["weights"] for f in leer_parquet(ruta / "treesMetadata")}
+        return Bosque(
+            p.get("featuresCol", "features"), p.get("probabilityCol", "probability"),
+            [Arbol(_nodos(por_arbol[i])) for i in ids],
+            [float(pesos_meta.get(i, 1.0)) for i in ids],
+        )
+
+    raise NotImplementedError(
+        f"Etapa de Spark no soportada: {clase}. "
+        "Soportadas: VectorAssembler, StandardScaler, MinMaxScaler, "
+        "LogisticRegression, DecisionTree y RandomForest."
+    )
+
+
+@dataclass
+class Modelo:
+    etapas: list
+    col_prob: str
+
+    def predecir(self, fila: dict) -> tuple[int, list[float]]:
+        cols = dict(fila)
+        for etapa in self.etapas:
+            etapa.aplicar(cols)
+        probs = cols[self.col_prob]
+        return max(range(len(probs)), key=probs.__getitem__), probs
+
+
+@st.cache_resource(show_spinner="Cargando el modelo...")
+def cargar_modelo() -> Modelo:
+    dir_etapas = MODEL_PATH / "stages"
+    carpetas = sorted(
+        (d for d in dir_etapas.iterdir() if d.is_dir()),
+        key=lambda d: int(d.name.split("_", 1)[0]),
+    )
+    etapas = [construir_etapa(d) for d in carpetas]
+    return Modelo(etapas, etapas[-1].salida_prob)
+
 
 # ----------------------------------------------------------------------------
 # Configuración y estilo
@@ -47,24 +292,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
-# ----------------------------------------------------------------------------
-# Carga del modelo (una sola vez)
-# ----------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Iniciando Spark y cargando el modelo...")
-def cargar_modelo():
-    spark = (
-        SparkSession.builder.master("local[1]")
-        .appName("app_desercion")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "1")
-        .config("spark.driver.memory", "1g")
-        .getOrCreate()
-    )
-    return spark, PipelineModel.load(MODEL_PATH)
-
-
-if not os.path.isdir(MODEL_PATH):
+if not MODEL_PATH.is_dir():
     st.error(
         "No se encontró la carpeta **modelo_final** junto a app.py. "
         "Descárgala de Colab (donde se ejecutó `best_model.write().overwrite().save('modelo_final')`) "
@@ -72,32 +300,12 @@ if not os.path.isdir(MODEL_PATH):
     )
     st.stop()
 
-spark, modelo = cargar_modelo()
-
-# Columnas EXACTAS (nombre y tipo) con las que se entrenó el pipeline.
-COLUMNAS_INT = [
-    "marital_status", "application_mode", "application_order", "course",
-    "daytime_evening_attendance", "previous_qualification", "nacionality",
-    "mother_s_qualification", "father_s_qualification", "mother_s_occupation",
-    "father_s_occupation", "displaced", "educational_special_needs", "debtor",
-    "tuition_fees_up_to_date", "gender", "scholarship_holder", "age_at_enrollment",
-    "international",
-    "curricular_units_1st_sem_credited", "curricular_units_1st_sem_enrolled",
-    "curricular_units_1st_sem_evaluations", "curricular_units_1st_sem_approved",
-    "curricular_units_1st_sem_without_evaluations",
-    "curricular_units_2nd_sem_credited", "curricular_units_2nd_sem_enrolled",
-    "curricular_units_2nd_sem_evaluations", "curricular_units_2nd_sem_approved",
-    "curricular_units_2nd_sem_without_evaluations",
-]
-COLUMNAS_DOUBLE = [
-    "curricular_units_1st_sem_grade", "curricular_units_2nd_sem_grade",
-    "unemployment_rate", "inflation_rate", "gdp",
-    "tasa_aprob_s1", "tasa_aprob_s2", "delta_nota",   # variables derivadas
-]
-ESQUEMA = StructType(
-    [StructField(c, IntegerType(), True) for c in COLUMNAS_INT]
-    + [StructField(c, DoubleType(), True) for c in COLUMNAS_DOUBLE]
-)
+try:
+    modelo = cargar_modelo()
+except Exception as e:  # noqa: BLE001
+    st.error("No se pudo cargar `modelo_final`.")
+    st.exception(e)
+    st.stop()
 
 # ----------------------------------------------------------------------------
 # Catálogos de códigos (dataset UCI / Kaggle "Predict Students' Dropout")
@@ -151,8 +359,8 @@ def select(label, opciones, valor_defecto, key, **kw):
 # ----------------------------------------------------------------------------
 # Encabezado
 # ----------------------------------------------------------------------------
-if os.path.exists(BANNER_PATH):
-    st.image(BANNER_PATH, use_container_width=True)
+if BANNER_PATH.exists():
+    st.image(str(BANNER_PATH), use_container_width=True)
 st.title("🎓 Predicción de deserción y éxito académico")
 st.markdown(
     "**Instrucciones:** 1) complete los datos del estudiante en las tres pestañas; "
@@ -231,7 +439,7 @@ if enviado:
     if s1_apro > s1_insc or s2_apro > s2_insc:
         st.warning("Hay más unidades aprobadas que inscritas en algún semestre; revise los datos.")
 
-    # Las 3 variables derivadas se calculan igual que en el notebook (A.5)
+    # Variables derivadas, calculadas igual que en el notebook (A.5)
     tasa_s1 = float(s1_apro) / s1_insc if s1_insc > 0 else 0.0
     tasa_s2 = float(s2_apro) / s2_insc if s2_insc > 0 else 0.0
     delta_nota = float(s2_nota) - float(s1_nota)
@@ -264,25 +472,14 @@ if enviado:
         "tasa_aprob_s1": tasa_s1, "tasa_aprob_s2": tasa_s2, "delta_nota": delta_nota,
     }
 
-    # Orden y tipos según el esquema (enteros nativos de Python, no numpy)
-    valores = tuple(
-        int(fila[f.name]) if isinstance(f.dataType, IntegerType) else float(fila[f.name])
-        for f in ESQUEMA.fields
-    )
-    sdf = spark.createDataFrame([valores], schema=ESQUEMA)
-
     try:
-        resultado = modelo.transform(sdf).select("prediction", "probability").first()
+        indice, probs = modelo.predecir(fila)
     except Exception as e:  # noqa: BLE001
-        st.error(
-            "No se pudo predecir con el modelo. Verifique que `modelo_final` se generó con el "
-            "notebook y que la versión de pyspark es la misma que la usada en Colab."
-        )
+        st.error("No se pudo predecir con el modelo. Revise que `modelo_final` corresponda al notebook.")
         st.exception(e)
         st.stop()
 
-    clase = LABELS[int(resultado["prediction"])]
-    probs = [float(p) for p in resultado["probability"].toArray()]
+    clase = LABELS[indice]
 
     st.subheader("Resultado")
     st.markdown(
@@ -298,9 +495,7 @@ if enviado:
             st.write(f"{LABELS_ES[etiqueta]} ({etiqueta}): **{p:.1%}**")
             st.progress(min(max(p, 0.0), 1.0))
     with col_b:
-        df_prob = pd.DataFrame(
-            {"Probabilidad": probs}, index=[LABELS_ES[e] for e in LABELS]
-        )
+        df_prob = pd.DataFrame({"Probabilidad": probs}, index=[LABELS_ES[e] for e in LABELS])
         st.bar_chart(df_prob)
 
     with st.expander("Ver variables derivadas calculadas"):
